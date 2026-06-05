@@ -9,6 +9,7 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from db.database import MessageDatabase
+from utils.llm import parse_tasks_from_text
 
 load_dotenv()
 
@@ -17,7 +18,6 @@ MESSAGE_LIMIT = 20
 bot = Bot(token=os.getenv('TELEGRAM_BOT_TOKEN'))
 dp = Dispatcher()
 db = MessageDatabase()
-
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
@@ -32,13 +32,13 @@ async def cmd_start(message: Message):
 
 @dp.message(Command("parse"))
 async def cmd_parse(message: Message):
-    """Ручной запуск анализа очереди (для тестирования)"""
+    """Ручной запуск анализа очереди"""
     await message.answer("Анализирую очередь сообщений...")
     
-    messages = db.get_unprocessed_messages(limit=MESSAGE_LIMIT)
+    messages = await asyncio.to_thread(db.get_unprocessed_messages, MESSAGE_LIMIT)
     
     if not messages:
-        await message.answer("Очередь пуста. Напишите что-нибудь в чат!")
+        await message.answer("📭 Очередь пуста. Напишите что-нибудь в чат!")
         return
     
     conversation_text = "\n".join([
@@ -46,23 +46,41 @@ async def cmd_parse(message: Message):
         for msg in messages
     ])
     
-    preview = conversation_text[:500] + "..." if len(conversation_text) > 500 else conversation_text
-    await message.answer(
-        f"Найдено {len(messages)} сообщений:\n\n"
-        f"```\n{preview}\n```"
-    )
+    print(f"Отправляю в LLM {len(messages)} сообщений:")
+    print(conversation_text[:200] + "...")
     
-    # TODO: Здесь будет вызов LLM и создание задач в Kanban
-    # Пока просто помечаем как обработанные
+    await message.answer("Отправляю в AI для анализа...")
+    tasks = await asyncio.to_thread(parse_tasks_from_text, conversation_text)
+    
+    if not tasks:
+        await message.answer("Задач не найдено в сообщениях.")
+        message_ids = [msg[0] for msg in messages]
+        await asyncio.to_thread(db.mark_as_processed, message_ids)
+        return
+    
+    response_text = f"📝 **Найдено задач: {len(tasks)}**\n\n"
+    for i, task in enumerate(tasks, 1):
+        response_text += f"📌 **Задача {i}:** {task.get('title')}\n"
+        if task.get('assignee'):
+            response_text += f"   👤 {task.get('assignee')}\n"
+        if task.get('deadline'):
+            response_text += f"   📅 {task.get('deadline')}\n"
+        if task.get('priority'):
+            priority_emoji = {"high": "🔥", "medium": "⚡", "low": "💤"}.get(task.get('priority'), "⚪")
+            response_text += f"   {priority_emoji} {task.get('priority')}\n"
+        response_text += "\n"
+    
+    # TODO: Здесь потом будет создание карточек в Kanban
+    
     message_ids = [msg[0] for msg in messages]
-    db.mark_as_processed(message_ids)
+    await asyncio.to_thread(db.mark_as_processed, message_ids)
     
-    await message.answer("Сообщения обработаны (заглушка - LLM ещё не подключен)")
+    await message.answer(response_text, parse_mode="Markdown")
 
 @dp.message(Command("stats"))
 async def cmd_stats(message: Message):
     """Показывает статистику очереди"""
-    stats = db.get_stats()
+    stats = await asyncio.to_thread(db.get_stats)
     await message.answer(
         f"Статистика очереди:\n"
         f"• Не обработано: {stats['unprocessed']}\n"
@@ -76,12 +94,13 @@ async def handle_all_messages(message: Message):
     if message.text and not message.text.startswith('/'):
         username = message.from_user.username or message.from_user.first_name
         
-        db.add_message(
-            message_id=message.message_id,
-            chat_id=message.chat.id,
-            user_id=message.from_user.id,
-            username=username,
-            text=message.text
+        await asyncio.to_thread(
+            db.add_message,
+            message.message_id,
+            message.chat.id,
+            message.from_user.id,
+            username,
+            message.text
         )
 
 async def main():
