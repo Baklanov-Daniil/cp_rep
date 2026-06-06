@@ -8,16 +8,20 @@ import sys
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from kanban.kanban_client import YouGileClient
 from db.database import MessageDatabase
 from utils.llm import parse_tasks_from_text
 
 load_dotenv()
 
 MESSAGE_LIMIT = 20
+# Лучше вынести ID колонки YouGile в .env, чтобы не хардкодить в коде
+YOUGILE_COLUMN_ID = os.getenv('YOUGILE_COLUMN_ID', 'id_твоей_колонки_по_умолчанию')
 
 bot = Bot(token=os.getenv('TELEGRAM_BOT_TOKEN'))
 dp = Dispatcher()
 db = MessageDatabase()
+kanban = YouGileClient()
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
@@ -43,6 +47,7 @@ async def cmd_parse(message: Message):
     
     conversation_text = "\n".join([
         f"[{msg[4]}]: {msg[5]}"
+        f"[{msg[4]}]: {msg[5]}"
         for msg in messages
     ])
     
@@ -59,8 +64,33 @@ async def cmd_parse(message: Message):
         return
     
     response_text = f"📝 **Найдено задач: {len(tasks)}**\n\n"
+    
+    # --- ИНТЕГРАЦИЯ С KANBAN ---
+    created_tasks_count = 0
+    
     for i, task in enumerate(tasks, 1):
-        response_text += f"📌 **Задача {i}:** {task.get('title')}\n"
+        title = task.get('title', 'Новая задача')
+        
+        # Формируем описание для карточки в YouGile из метаданных LLM
+        description_parts = []
+        if task.get('assignee'):
+            description_parts.append(f"Исполнитель: {task.get('assignee')}")
+        if task.get('deadline'):
+            description_parts.append(f"Дедлайн: {task.get('deadline')}")
+        if task.get('priority'):
+            description_parts.append(f"Приоритет: {task.get('priority')}")
+        
+        description = "\n".join(description_parts) if description_parts else "Создано автоматически AI PM."
+
+        try:
+            # Отправляем в YouGile внутри отдельного потока
+            await asyncio.to_thread(kanban.create_task, YOUGILE_COLUMN_ID, title, description)
+            created_tasks_count += 1
+        except Exception as e:
+            print(f"Ошибка при создании задачи '{title}' в YouGile: {e}")
+            
+        # Красиво оформляем ответ в Telegram
+        response_text += f"📌 **Задача {i}:** {title}\n"
         if task.get('assignee'):
             response_text += f"   👤 {task.get('assignee')}\n"
         if task.get('deadline'):
@@ -70,7 +100,8 @@ async def cmd_parse(message: Message):
             response_text += f"   {priority_emoji} {task.get('priority')}\n"
         response_text += "\n"
     
-    # TODO: Здесь потом будет создание карточек в Kanban
+    response_text += f"🚀 Экспортировано в YouGile: {created_tasks_count} из {len(tasks)}"
+    # ---------------------------
     
     message_ids = [msg[0] for msg in messages]
     await asyncio.to_thread(db.mark_as_processed, message_ids)
