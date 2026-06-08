@@ -7,24 +7,25 @@
     <script src="https://telegram.org/js/telegram-web-app.js"></script>
     <style>
         body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-            background-color: var(--tg-theme-bg-color, #fff);
-            color: var(--tg-theme-text-color, #000);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background-color: var(--tg-theme-bg-color, #17212b);
+            color: var(--tg-theme-text-color, #f5f5f5);
             margin: 0; padding: 20px; display: flex; flex-direction: column; gap: 15px;
         }
         .form-group { display: flex; flex-direction: column; gap: 5px; }
-        label { font-size: 14px; font-weight: bold; color: var(--tg-theme-hint-color, #999); }
+        label { font-size: 14px; font-weight: bold; color: var(--tg-theme-hint-color, #708499); }
         input {
-            padding: 12px; border: 1px solid var(--tg-theme-hint-color, #ccc);
-            border-radius: 8px; background: var(--tg-theme-secondary-bg-color, #f0f0f0);
-            color: var(--tg-theme-text-color, #000); font-size: 16px;
+            padding: 12px; border: 1px solid var(--tg-theme-hint-color, #2b394a);
+            border-radius: 8px; background: var(--tg-theme-secondary-bg-color, #24303f);
+            color: var(--tg-theme-text-color, #fff); font-size: 16px; outline: none;
         }
         button {
             margin-top: 10px; padding: 15px; border: none; border-radius: 8px;
-            background-color: var(--tg-theme-button-color, #2481cc);
+            background-color: var(--tg-theme-button-color, #5288c1);
             color: var(--tg-theme-button-text-color, #fff);
             font-size: 16px; font-weight: bold; cursor: pointer;
         }
+        button:active { opacity: 0.8; }
     </style>
 </head>
 <body>
@@ -40,24 +41,42 @@
     <button id="submit_btn">Войти и выбрать компанию</button>
 
     <script>
+        // Инициализация Telegram WebApp
         const tg = window.Telegram.WebApp;
-        tg.ready(); // Инициализация окна в ТГ
-        tg.expand(); // Раскрыть на максимум
+        
+        try {
+            tg.ready();
+            tg.expand();
+        } catch (e) {
+            alert("Ошибка инициализации Telegram API: " + e.message);
+        }
 
         document.getElementById('submit_btn').addEventListener('click', () => {
-            const login = document.getElementById('login').value.trim();
-            const pass = document.getElementById('password').value.trim();
+            const loginInput = document.getElementById('login').value.trim();
+            const passwordInput = document.getElementById('password').value.trim();
 
-            if (!login || !pass) {
+            if (!loginInput || !passwordInput) {
                 alert('Пожалуйста, заполните все поля!');
                 return;
             }
 
-            // Безопасно упаковываем данные в строку для отправки боту
-            const dataStr = JSON.stringify({ login: login, password: pass });
-            
-            // Метод отправляет данные боту и автоматически закрывает окно
-            tg.sendData(dataStr);
+            // Формируем объект данных
+            const dataObj = { login: loginInput, password: passwordInput };
+            const dataStr = JSON.stringify(dataObj);
+
+            // Проверяем, доступен ли метод отправки данных в Telegram
+            if (tg && typeof tg.sendData === 'function') {
+                try {
+                    // Отправляем данные боту
+                    tg.sendData(dataStr);
+                    // Закрываем WebApp окно
+                    tg.close();
+                } catch (err) {
+                    alert("Ошибка при вызове sendData: " + err.message);
+                }
+            } else {
+                alert("Telegram WebApp API недоступно. Убедитесь, что открыли окно через кнопку клавиатуры бота.");
+            }
         });
     </script>
 </body>
