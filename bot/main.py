@@ -1,508 +1,140 @@
 """
-Telegram-бот AI PM для автоматизации YouGile.
+Telegram entrypoint for AI PM: Telegram conversations in, YouGile tasks out.
 """
 
 import asyncio
 import json
 import os
-import re
 import sys
 import time
-from datetime import datetime, timedelta, timezone
 
-import requests
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import (
-    BotCommand,
-    CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    KeyboardButton,
-    Message,
-    ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
-    WebAppInfo,
-)
-from dotenv import load_dotenv
+from aiogram.types import BotCommand, CallbackQuery, Message, ReplyKeyboardRemove
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from kanban.kanban_client import YouGileClient
-from utils.llm import parse_tasks_from_text
-
-# ---------------------------------------------------------------------------
-# Конфигурация
-# ---------------------------------------------------------------------------
-
-load_dotenv()
-
-WEB_APP_URL           = "https://jolly-flan-a04ec.netlify.app/"
-REALTIME_DELAY        = 15    # сек тишины → триггер обработки
-MAX_CONVERSATION_TIME = 900   # сек максимальной длины сессии
-MIGRATION_INTERVAL    = 300   # сек между фоновыми проверками дедлайнов (5 мин)
-
-# ---------------------------------------------------------------------------
-# Глобальные объекты
-# ---------------------------------------------------------------------------
-
-bot    = Bot(token=os.getenv("TELEGRAM_BOT_TOKEN"))
-dp     = Dispatcher()
-
-def _make_kanban() -> YouGileClient:
-    return YouGileClient()
-
-kanban: YouGileClient = _make_kanban()
-
-# ---------------------------------------------------------------------------
-# In-memory хранилища
-# ---------------------------------------------------------------------------
-
-chat_buffers:     dict[int, list[dict]] = {}   # {chat_id: [{"username", "text"}]}
-chat_timers:      dict[int, asyncio.Task] = {}  # дебаунс-таймеры
-chat_start_times: dict[int, float] = {}         # начало текущей сессии
-
-SESSION_STATS = {"processed_messages_count": 0, "created_tasks_count": 0}
-
-# Кэш ID колонок — заполняется после /get_key → выбор проекта
-COLUMNS_CACHE: dict[str, str | None] = {
-    "participants":   None,  # 1. Участники проекта
-    "no_deadline":    None,  # 2. Без дедлайна
-    "has_deadline":   None,  # 3. Дедлайн есть
-    "urgent_deadline":None,  # 4. Дедлайн < 2 дней
-    "done":           None,  # 5. Выполнено
-}
-
-# ---------------------------------------------------------------------------
-# FSM
-# ---------------------------------------------------------------------------
-
-class AuthStates(StatesGroup):
-    waiting_for_company = State()
-    waiting_for_project = State()
-
-# ---------------------------------------------------------------------------
-# Утилиты
-# ---------------------------------------------------------------------------
-
-def update_env_file(key: str, value: str) -> None:
-    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-    lines: list[str] = []
-    if os.path.exists(env_path):
-        with open(env_path, "r", encoding="utf-8") as fh:
-            lines = fh.readlines()
-
-    updated = False
-    new_lines = []
-    for line in lines:
-        if line.strip().startswith(f"{key}="):
-            new_lines.append(f"{key}={value}\n")
-            updated = True
-        else:
-            new_lines.append(line)
-    if not updated:
-        new_lines.append(f"{key}={value}\n")
-
-    with open(env_path, "w", encoding="utf-8") as fh:
-        fh.writelines(new_lines)
-    os.environ[key] = value
+from bot.board_setup import create_ai_pm_board, update_env_file
+from bot.config import load_config
+from bot.conversation import SessionStats, process_conversation, username_from_message_user
+from bot.repositories import (
+    columns_from_settings,
+    get_chat_settings,
+    is_chat_connected,
+    pending_count,
+    save_board_settings,
+    save_pending_message,
+    upsert_chat_member,
+)
+from bot.scheduler import monitor_deadlines
+from bot.states import AuthStates
+from bot.task_digest import send_task_digest
+from bot.ui import companies_keyboard, connected_setup_keyboard, main_menu_keyboard, projects_keyboard, reconnect_keyboard
+from bot.yougile_auth import get_companies, get_or_create_api_key, get_projects
+from db.database import init_db
 
 
-def calculate_msk_deadline(
-    day_marker: str,
-    week_marker: str,
-    time_marker: str,
-) -> datetime | None:
-    if not day_marker:
-        return None
+config = load_config()
+if not config.telegram_token:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN is not configured")
 
-    tz_msk   = timezone(timedelta(hours=0))
-    now_msk  = datetime.now(tz_msk)
-    time_str = (time_marker or "18:00").strip()
+bot = Bot(token=config.telegram_token)
+dp = Dispatcher()
+stats = SessionStats()
 
-    def _apply_time(dt: datetime) -> datetime:
-        try:
-            h, m = map(int, time_str.split(":"))
-        except ValueError:
-            h, m = 18, 0
-        return dt.replace(hour=h, minute=m, second=0, microsecond=0)
-
-    if re.match(r"^\d{4}-\d{2}-\d{2}$", day_marker):
-        try:
-            base = datetime.strptime(day_marker, "%Y-%m-%d").replace(tzinfo=tz_msk)
-            return _apply_time(base)
-        except ValueError:
-            return None
-
-    if day_marker == "today":
-        return _apply_time(now_msk)
-    if day_marker == "tomorrow":
-        return _apply_time(now_msk + timedelta(days=1))
-
-    days_map = {
-        "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
-        "friday": 4, "saturday": 5, "sunday": 6,
-    }
-    target_num = days_map.get(day_marker.lower())
-    if target_num is None:
-        return None
-
-    cur = now_msk.weekday()
-    if week_marker == "next":
-        days_ahead = (target_num - cur) % 7 or 7
-        days_ahead += 7
-    else:
-        days_ahead = (target_num - cur) % 7
-        if days_ahead == 0 and _apply_time(now_msk) <= now_msk:
-            days_ahead = 7
-
-    return _apply_time(now_msk + timedelta(days=days_ahead))
+chat_timers: dict[int, asyncio.Task] = {}
+chat_start_times: dict[int, float] = {}
 
 
-def create_yougile_board_and_columns(api_key: str, project_id: str) -> dict:
-    """Создаёт доску «Канбан AI PM» и 5 колонок; заполняет COLUMNS_CACHE."""
-    master_key    = os.getenv("YOUGILE_API_KEY", "")
-    keys_to_try   = list(dict.fromkeys(filter(None, [master_key, api_key])))
-    headers       = {"Content-Type": "application/json"}
-    board_id      = None
-    used_key      = None
+async def is_group_admin(message: Message) -> bool:
+    if message.chat.type == "private":
+        return True
+    member = await bot.get_chat_member(message.chat.id, message.from_user.id)
+    return member.status in {"administrator", "creator"}
 
-    for key in keys_to_try:
-        headers["Authorization"] = f"Bearer {key}"
-        r = requests.post(
-            "https://ru.yougile.com/api-v2/boards",
-            json={"title": "Канбан AI PM", "projectId": project_id},
-            headers=headers,
-            timeout=15,
+
+async def is_callback_admin(callback: CallbackQuery) -> bool:
+    if callback.message.chat.type == "private":
+        return True
+    member = await bot.get_chat_member(callback.message.chat.id, callback.from_user.id)
+    return member.status in {"administrator", "creator"}
+
+
+async def remember_sender(message: Message, role: str = "user") -> None:
+    if not message.from_user:
+        return
+    username = username_from_message_user(message.from_user)
+    await upsert_chat_member(message.chat.id, message.from_user.id, username, role=role)
+
+
+async def render_status(chat_id: int) -> str:
+    settings = await get_chat_settings(chat_id)
+    pending = await pending_count(chat_id)
+    if not is_chat_connected(settings):
+        return (
+            "📊 <b>Статус AI PM</b>\n\n"
+            "🔴 YouGile ещё не подключён.\n"
+            f"💬 Реплик в очереди: <b>{pending}</b>\n\n"
+            "Нажмите <b>🔑 Подключить YouGile</b>, чтобы выбрать компанию и проект."
         )
-        if r.status_code in (200, 201):
-            board_id = r.json().get("id")
-            used_key = key
-            print(f"[YouGile] Доска создана ID={board_id}")
-            break
-        print(f"[YouGile] Ключ отклонён HTTP {r.status_code}")
 
-    if not board_id:
-        return {"success": False, "used_key": None}
+    columns = columns_from_settings(settings)
+    return (
+        "📊 <b>Статус AI PM</b>\n\n"
+        "🟢 YouGile подключён\n"
+        f"🧩 Project ID: <code>{settings.project_id}</code>\n"
+        f"🗂 Board ID: <code>{settings.board_id}</code>\n"
+        f"💬 Реплик в очереди: <b>{pending}</b>\n\n"
+        "Колонки:\n"
+        f"👥 Участники: <code>{columns['participants']}</code>\n"
+        f"📥 Без дедлайна: <code>{columns['no_deadline']}</code>\n"
+        f"📅 С дедлайном: <code>{columns['has_deadline']}</code>\n"
+        f"🔥 Срочно: <code>{columns['urgent_deadline']}</code>\n"
+        f"✅ Выполнено: <code>{columns['done']}</code>"
+    )
 
-    # Порядок колонок ВАЖЕН — совпадает с индексами COLUMNS_CACHE
-    columns_ordered = [
-        "👥 Участники проекта",     # 0 → participants
-        "🔥 Дедлайн < 2 дней",       # 3 → urgent_deadline
-        "📅 Дедлайн есть",           # 2 → has_deadline
-        "📥 Без дедлайна",           # 1 → no_deadline
-        "✅ Выполнено",              # 4 → done
-    ]
-    cache_keys = ["participants", "no_deadline", "has_deadline", "urgent_deadline", "done"]
 
-    created_ids: list[str] = []
-    for title in columns_ordered:
-        r = requests.post(
-            "https://ru.yougile.com/api-v2/columns",
-            json={"title": title, "boardId": board_id},
-            headers=headers,
-            timeout=15,
-        )
-        if r.status_code in (200, 201):
-            created_ids.append(r.json().get("id"))
-        else:
-            print(f"[YouGile] Ошибка колонки '{title}': {r.text[:120]}")
-
-    if len(created_ids) == 5:
-        for i, cache_key in enumerate(cache_keys):
-            COLUMNS_CACHE[cache_key] = created_ids[i]
-        return {"success": True, "used_key": used_key}
-
-    print(f"[YouGile] Создано {len(created_ids)}/5 колонок.")
-    return {"success": False, "used_key": used_key}
-
-# ---------------------------------------------------------------------------
-# Фоновый воркер: миграция задач по дедлайну
-# ---------------------------------------------------------------------------
-
-async def background_migrator() -> None:
-    """
-    Каждые MIGRATION_INTERVAL секунд проверяет задачи во всех рабочих колонках
-    и перемещает их в соответствии с текущим дедлайном.
-    """
-    await asyncio.sleep(30)  # небольшая задержка после старта
-    while True:
-        try:
-            if all(COLUMNS_CACHE.values()):
-                moved = await asyncio.to_thread(
-                    kanban.migrate_tasks_by_deadline, COLUMNS_CACHE
-                )
-                if moved:
-                    print(f"[Миграция] Перемещено задач: {moved}")
-        except Exception as e:
-            print(f"[Миграция] Ошибка: {e}")
-        await asyncio.sleep(MIGRATION_INTERVAL)
-
-# ---------------------------------------------------------------------------
-# Команды бота
-# ---------------------------------------------------------------------------
-
-@dp.message(Command("start"))
-async def cmd_start(message: Message) -> None:
+async def show_main_menu(message: Message) -> None:
+    await remember_sender(message)
+    settings = await get_chat_settings(message.chat.id)
     await message.answer(
-        "🤖 <b>Привет! Я AI Project Manager.</b>\n\n"
-        "Анализирую диалог в группе, вытаскиваю задачи и создаю их в YouGile.\n"
-        "Задачи автоматически переезжают между колонками при изменении дедлайна.\n\n"
-        "Управление — в меню <b>[ Menu ]</b> слева от поля ввода.",
+        "🧭 <b>AI PM меню</b>\n\n"
+        "Выберите действие. Я могу подключить YouGile, показать состояние очереди, "
+        "обработать накопленные сообщения или разослать задачи ответственным.",
         parse_mode="HTML",
-        reply_markup=ReplyKeyboardRemove(),
+        reply_markup=main_menu_keyboard(is_chat_connected(settings)),
     )
 
 
-@dp.message(Command("get_key"))
-async def cmd_get_key(message: Message) -> None:
-    try:
-        await message.delete()
-    except Exception:
-        pass
-    keyboard = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(
-            text="🔑 Вход в YouGile",
-            web_app=WebAppInfo(url=WEB_APP_URL),
-        )]],
-        resize_keyboard=True,
-        one_time_keyboard=True,
-    )
+async def ask_for_yougile_login(message: Message) -> None:
     await message.answer(
-        "Нажмите <b>«🔑 Вход в YouGile»</b> для безопасной авторизации.\n"
-        "Логин и пароль будут скрыты от истории чата.",
+        "🔑 <b>Подключение YouGile</b>\n\n"
+        "Нажмите кнопку ниже и войдите в YouGile. После этого я предложу компанию и проект.\n"
+        "Если чат уже был подключён, повторная авторизация не нужна — используйте меню настроек.",
         parse_mode="HTML",
-        reply_markup=keyboard,
+        reply_markup=reconnect_keyboard(config.web_app_url),
     )
 
 
-@dp.message(Command("stats"))
-async def cmd_stats(message: Message) -> None:
-    pending = len(chat_buffers.get(message.chat.id, []))
+async def send_digest_and_report(message: Message) -> None:
+    result = await send_task_digest(bot, message.chat.id)
+    if result["error"] == "not_connected":
+        await message.answer("🔴 Сначала подключите YouGile через /get_key или /menu.")
+        return
+
     await message.answer(
-        "📋 <b>Статистика сессии:</b>\n"
-        f"• В буфере (ожидают AI): <b>{pending}</b> реплик\n"
-        f"• Всего обработано реплик: <b>{SESSION_STATS['processed_messages_count']}</b>\n"
-        f"• Создано задач в YouGile: <b>{SESSION_STATS['created_tasks_count']}</b>",
+        "📨 <b>Рассылка задач завершена</b>\n\n"
+        f"Задач в дайджесте: <b>{result['tasks']}</b>\n"
+        f"Личных сообщений отправлено: <b>{result['sent']}</b>\n"
+        f"Сообщений в группу: <b>{result['fallback']}</b>\n\n"
+        "Если кому-то задача пришла в группу, значит пользователь ещё не открывал личный чат с ботом "
+        "или его Telegram ID не найден в участниках.",
         parse_mode="HTML",
     )
 
-# ---------------------------------------------------------------------------
-# Web App: получение логина/пароля
-# ---------------------------------------------------------------------------
 
-@dp.message(F.web_app_data)
-async def process_web_app_data(message: Message, state: FSMContext) -> None:
-    try:
-        data: dict = json.loads(message.web_app_data.data)
-    except (json.JSONDecodeError, AttributeError) as e:
-        await message.answer(f"🔴 Ошибка разбора Web App данных: {e}",
-                             reply_markup=ReplyKeyboardRemove())
-        return
-
-    login    = data.get("login", "").strip()
-    password = data.get("password", "").strip()
-    if not login or not password:
-        await message.answer("🔴 Логин или пароль не переданы.",
-                             reply_markup=ReplyKeyboardRemove())
-        return
-
-    status = await message.answer("⏳ Подключаюсь к YouGile...",
-                                  reply_markup=ReplyKeyboardRemove())
-    headers = {"Content-Type": "application/json", "Accept": "application/json"}
-    url     = "https://ru.yougile.com/api-v2/auth/companies"
-
-    resp = await asyncio.to_thread(
-        requests.post, url,
-        json={"login": login, "password": password},
-        headers=headers, timeout=15,
-    )
-    if resp.status_code == 401:
-        resp = await asyncio.to_thread(
-            requests.post, url,
-            json={"email": login, "password": password},
-            headers=headers, timeout=15,
-        )
-
-    if resp.status_code not in (200, 201):
-        await status.edit_text("🔴 Неверный логин или пароль.")
-        return
-
-    body = resp.json()
-    companies = (
-        body if isinstance(body, list)
-        else body.get("content") or body.get("data") or [body]
-    )
-    if not companies:
-        await status.edit_text("🔴 Нет доступных компаний.")
-        return
-
-    await state.set_state(AuthStates.waiting_for_company)
-    await state.update_data(login=login, password=password)
-
-    markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text=c.get("name") or f"Компания {c.get('id','?')}",
-            callback_data=f"company_{c.get('id')}",
-        )]
-        for c in companies
-    ])
-    await status.delete()
-    await message.answer(
-        f"🍏 <b>Успешный вход!</b>\nАккаунт: <code>{login}</code>\n\n"
-        "Выберите компанию:",
-        parse_mode="HTML",
-        reply_markup=markup,
-    )
-
-# ---------------------------------------------------------------------------
-# FSM шаг 1: выбор компании
-# ---------------------------------------------------------------------------
-
-@dp.callback_query(AuthStates.waiting_for_company, F.data.startswith("company_"))
-async def process_company_choice(callback: CallbackQuery, state: FSMContext) -> None:
-    company_id = callback.data.removeprefix("company_")
-    data       = await state.get_data()
-    login, password = data["login"], data["password"]
-
-    await callback.message.edit_text("⏳ Получаю список проектов...")
-
-    headers   = {"Content-Type": "application/json", "Accept": "application/json"}
-    token_url = "https://ru.yougile.com/api-v2/auth/keys/get"
-
-    resp = await asyncio.to_thread(
-        requests.post, token_url,
-        json={"login": login, "password": password, "companyId": company_id},
-        headers=headers, timeout=15,
-    )
-    if resp.status_code not in (200, 201):
-        resp = await asyncio.to_thread(
-            requests.post, token_url,
-            json={"email": login, "password": password, "companyId": company_id},
-            headers=headers, timeout=15,
-        )
-
-    if resp.status_code not in (200, 201):
-        await callback.message.edit_text(
-            f"🔴 Не удалось получить токен (HTTP {resp.status_code})."
-        )
-        await state.clear()
-        await callback.answer()
-        return
-
-    # Извлекаем ключ из любого формата ответа (list или dict)
-    token_body = resp.json()
-    if isinstance(token_body, list):
-        token_obj = next(
-            (t for t in token_body if isinstance(t, dict) and not t.get("deleted")),
-            token_body[0] if token_body else None,
-        )
-    elif isinstance(token_body, dict):
-        token_obj = token_body
-    else:
-        token_obj = None
-
-    api_key = None
-    if isinstance(token_obj, dict):
-        api_key = (
-            token_obj.get("key")
-            or token_obj.get("token")
-            or (token_obj.get("content") or {}).get("key")
-        )
-
-    if not api_key:
-        await callback.message.edit_text("🔴 Сервер не вернул API-ключ.")
-        await state.clear()
-        await callback.answer()
-        return
-
-    # Загружаем проекты
-    auth_h = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    proj_r = await asyncio.to_thread(
-        requests.get, "https://ru.yougile.com/api-v2/projects",
-        headers=auth_h, timeout=15,
-    )
-    if proj_r.status_code != 200:
-        await callback.message.edit_text(
-            f"🔴 Не удалось получить проекты (HTTP {proj_r.status_code})."
-        )
-        await state.clear()
-        await callback.answer()
-        return
-
-    proj_body = proj_r.json()
-    projects  = proj_body if isinstance(proj_body, list) else proj_body.get("content", [])
-    if not projects:
-        await callback.message.edit_text("🔴 Нет доступных проектов в этой компании.")
-        await state.clear()
-        await callback.answer()
-        return
-
-    await state.set_state(AuthStates.waiting_for_project)
-    await state.update_data(api_key=api_key, company_id=company_id)
-
-    markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text=p.get("title") or f"Проект {p.get('id','?')}",
-            callback_data=f"project_{p.get('id')}",
-        )]
-        for p in projects
-    ])
-    await callback.message.edit_text(
-        "📁 Выберите проект для создания задач:",
-        reply_markup=markup,
-    )
-    await callback.answer()
-
-# ---------------------------------------------------------------------------
-# FSM шаг 2: выбор проекта → создаём доску
-# ---------------------------------------------------------------------------
-
-@dp.callback_query(AuthStates.waiting_for_project, F.data.startswith("project_"))
-async def process_project_choice(callback: CallbackQuery, state: FSMContext) -> None:
-    project_id = callback.data.removeprefix("project_")
-    data       = await state.get_data()
-    api_key    = data["api_key"]
-    company_id = data["company_id"]
-
-    await callback.message.edit_text("⏳ Разворачиваю доску «Канбан AI PM» и 5 колонок...")
-
-    result = await asyncio.to_thread(create_yougile_board_and_columns, api_key, project_id)
-
-    if result["success"]:
-        working_key = result["used_key"]
-        await asyncio.to_thread(update_env_file, "YOUGILE_API_KEY", working_key)
-        await asyncio.to_thread(update_env_file, "YOUGILE_COMPANY_ID", company_id)
-        global kanban
-        kanban = _make_kanban()
-
-        await callback.message.edit_text(
-            "🚀 <b>Структура AI-доски успешно развёрнута!</b>\n\n"
-            "Создана доска <b>«Канбан AI PM»</b> с 5 колонками:\n"
-            "👥 Участники → 📥 Без дедлайна → 📅 Дедлайн есть → 🔥 Горит → ✅ Выполнено\n\n"
-            "Токен сохранён в <code>.env</code>. 📁\n\n"
-            "<b>Что дальше:</b> просто общайтесь в группе — бот сам создаст задачи "
-            "и карточки участников. Или добавьте участников вручную в колонку "
-            "<i>«👥 Участники проекта»</i> в формате:\n"
-            "<code>Иван Иванов (@username_tg)</code>",
-            parse_mode="HTML",
-        )
-    else:
-        await callback.message.edit_text(
-            "🔴 Не удалось создать структуру колонок.\n"
-            "Проверьте права токена и попробуйте снова."
-        )
-
-    await state.clear()
-    await callback.answer()
-
-# ---------------------------------------------------------------------------
-# Конвейер анализа диалога
-# ---------------------------------------------------------------------------
-
-async def _cancel_timer(chat_id: int) -> None:
+async def cancel_timer(chat_id: int) -> None:
     task = chat_timers.pop(chat_id, None)
     if task and not task.done():
         task.cancel()
@@ -512,179 +144,304 @@ async def _cancel_timer(chat_id: int) -> None:
             pass
 
 
-async def process_live_conversation(chat_id: int) -> None:
-    """
-    1. Берёт буфер сообщений из памяти.
-    2. Отправляет в LLM → получает задачи + участников.
-    3. Создаёт карточки участников в колонке «Участники проекта».
-    4. Создаёт задачи в нужных колонках на основе дедлайна.
-    """
+async def debounce_processing(chat_id: int) -> None:
+    await asyncio.sleep(config.realtime_delay)
+    await process_chat_queue(chat_id)
+
+
+async def process_chat_queue(chat_id: int) -> None:
     try:
-        api_key = os.getenv("YOUGILE_API_KEY")
-        if not api_key:
-            print("[AI PM] YOUGILE_API_KEY не задан.")
-            return
-        if not COLUMNS_CACHE["no_deadline"]:
-            print("[AI PM] Колонки не инициализированы.")
-            return
-
-        messages = chat_buffers.pop(chat_id, [])
-        if not messages:
-            return
-
-        SESSION_STATS["processed_messages_count"] += len(messages)
-        conversation_text = "\n".join(f"[{m['username']}]: {m['text']}" for m in messages)
-
-        # --- LLM ---
-        tasks, participants = await asyncio.to_thread(parse_tasks_from_text, conversation_text)
-
-        # --- Обрабатываем участников ---
-        parts_col = COLUMNS_CACHE["participants"]
-        if participants and parts_col:
-            for person in participants:
-                name       = person.get("full_name", "").strip()
-                tg_username = person.get("tg_username")
-                if not name:
-                    continue
-                await asyncio.to_thread(
-                    kanban.ensure_participant_card,
-                    parts_col,
-                    name,
-                    tg_username,
-                )
-
-        if not tasks:
-            return
-
-        # --- Создаём задачи ---
-        tz_msk        = timezone(timedelta(hours=3))
-        created_count = 0
-
-        for task in tasks:
-            title          = task.get("title") or "Новая задача"
-            assignee_name  = task.get("assignee")
-
-            # Ищем @tg_username исполнителя
-            tg_username = None
-            if assignee_name and parts_col:
-                tg_username = await asyncio.to_thread(
-                    kanban.get_tg_username_for_assignee,
-                    assignee_name,
-                    parts_col,
-                )
-
-            # Добавляем @mention в заголовок задачи
-            mention_prefix = f"{tg_username} " if tg_username else ""
-            final_title    = f"{mention_prefix}{title}"
-
-            # Дедлайн
-            deadline_dt = calculate_msk_deadline(
-                day_marker  = task.get("deadline_day", ""),
-                week_marker = task.get("deadline_week", "current"),
-                time_marker = task.get("deadline_time", "18:00"),
-            )
-
-            # Выбираем колонку
-            deadline_str: str | None = None
-            if deadline_dt:
-                deadline_str = deadline_dt.strftime("%Y-%m-%d %H:%M")
-                now_msk      = datetime.now(tz_msk)
-                diff         = deadline_dt - now_msk
-                if diff.total_seconds() < 0:
-                    target_column = COLUMNS_CACHE["done"]
-                elif diff <= timedelta(days=2):
-                    target_column = COLUMNS_CACHE["urgent_deadline"]
-                else:
-                    target_column = COLUMNS_CACHE["has_deadline"]
-            else:
-                target_column = COLUMNS_CACHE["no_deadline"]
-
-            description = (
-                f"Исполнитель: {assignee_name or 'Не назначен'}\n"
-                f"Приоритет: {task.get('priority', 'medium')}\n"
-                "Создано AI PM автоматически."
-            )
-
-            try:
-                await asyncio.to_thread(
-                    kanban.create_task,
-                    target_column,
-                    final_title,
-                    description,
-                    deadline_str=deadline_str,
-                    assignee_name=assignee_name,
-                    participants_column_id=parts_col,
-                )
-                created_count += 1
-                SESSION_STATS["created_tasks_count"] += 1
-            except Exception as e:
-                print(f"[AI PM] Ошибка создания задачи «{final_title}»: {e}")
-
-        if created_count > 0:
-            await bot.send_message(
-                chat_id,
-                f"🤖 <b>AI PM:</b> создал <b>{created_count}</b> задач в YouGile 🚀\n"
-                f"Автомиграция задач по дедлайну работает в фоне (каждые 5 мин).",
-                parse_mode="HTML",
-            )
-
-    except Exception as e:
-        print(f"[AI PM] Критическая ошибка: {e}")
+        await process_conversation(chat_id, bot, stats)
     finally:
         chat_timers.pop(chat_id, None)
         chat_start_times.pop(chat_id, None)
 
 
-async def _debounce_timer(chat_id: int) -> None:
-    await asyncio.sleep(REALTIME_DELAY)
-    await process_live_conversation(chat_id)
+async def schedule_chat_processing(chat_id: int) -> None:
+    elapsed = time.monotonic() - chat_start_times[chat_id]
+    await cancel_timer(chat_id)
 
-# ---------------------------------------------------------------------------
-# Хэндлер всех текстовых сообщений
-# ---------------------------------------------------------------------------
+    if elapsed >= config.max_conversation_time:
+        asyncio.create_task(process_chat_queue(chat_id))
+        return
+
+    chat_timers[chat_id] = asyncio.create_task(debounce_processing(chat_id))
+
+
+@dp.message(Command("start"))
+async def cmd_start(message: Message) -> None:
+    await remember_sender(message)
+    await message.answer(
+        "🤖 <b>Привет! Я AI Project Manager.</b>\n\n"
+        "Анализирую диалог в группе, вытаскиваю задачи и создаю их в YouGile.\n"
+        "Задачи автоматически переезжают между колонками при изменении дедлайна.\n\n"
+        "Управление — в меню <b>[ Menu ]</b> слева от поля ввода.",
+        parse_mode="HTML",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    await show_main_menu(message)
+
+
+@dp.message(Command("menu"))
+async def cmd_menu(message: Message) -> None:
+    await show_main_menu(message)
+
+
+@dp.message(Command("get_key"))
+async def cmd_get_key(message: Message) -> None:
+    is_admin = await is_group_admin(message)
+    await remember_sender(message, role="admin" if is_admin else "user")
+    if not is_admin:
+        await message.answer("❌ Настраивать интеграцию YouGile может только администратор группы.")
+        return
+
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    settings = await get_chat_settings(message.chat.id)
+    if is_chat_connected(settings):
+        await message.answer(
+            "🟢 <b>YouGile уже подключён.</b>\n\n"
+            "Повторно вводить логин и пароль не нужно. Можно посмотреть статус, "
+            "разослать задачи или переподключить проект вручную.",
+            parse_mode="HTML",
+            reply_markup=connected_setup_keyboard(),
+        )
+        return
+
+    await ask_for_yougile_login(message)
+
+
+@dp.message(Command("stats"))
+async def cmd_stats(message: Message) -> None:
+    await remember_sender(message)
+    pending = await pending_count(message.chat.id)
+    await message.answer(
+        "📋 <b>Статистика сессии:</b>\n"
+        f"• В буфере (ожидают AI): <b>{pending}</b> реплик\n"
+        f"• Всего обработано реплик: <b>{stats.processed_messages_count}</b>\n"
+        f"• Создано задач в YouGile: <b>{stats.created_tasks_count}</b>",
+        parse_mode="HTML",
+    )
+
+
+@dp.message(Command("status"))
+async def cmd_status(message: Message) -> None:
+    await remember_sender(message)
+    settings = await get_chat_settings(message.chat.id)
+    await message.answer(
+        await render_status(message.chat.id),
+        parse_mode="HTML",
+        reply_markup=main_menu_keyboard(is_chat_connected(settings)),
+    )
+
+
+@dp.message(Command("send_tasks"))
+async def cmd_send_tasks(message: Message) -> None:
+    is_admin = await is_group_admin(message)
+    await remember_sender(message, role="admin" if is_admin else "user")
+    if not is_admin:
+        await message.answer("❌ Рассылать задачи может только администратор группы.")
+        return
+    await send_digest_and_report(message)
+
+
+@dp.callback_query(F.data == "menu_setup")
+async def cb_menu_setup(callback: CallbackQuery) -> None:
+    if not await is_callback_admin(callback):
+        await callback.answer("Только администратор может менять подключение.", show_alert=True)
+        return
+    settings = await get_chat_settings(callback.message.chat.id)
+    if is_chat_connected(settings):
+        await callback.message.edit_text(
+            "⚙️ <b>Настройки подключения</b>\n\n"
+            "YouGile уже подключён. Повторная авторизация не нужна.",
+            parse_mode="HTML",
+            reply_markup=connected_setup_keyboard(),
+        )
+    else:
+        await callback.message.answer(
+            "🔑 YouGile ещё не подключён. Запустите авторизацию кнопкой ниже.",
+            reply_markup=reconnect_keyboard(config.web_app_url),
+        )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "setup_reconnect")
+async def cb_setup_reconnect(callback: CallbackQuery) -> None:
+    if not await is_callback_admin(callback):
+        await callback.answer("Только администратор может переподключать YouGile.", show_alert=True)
+        return
+    await callback.message.answer(
+        "🔁 Переподключение YouGile. Войдите заново и выберите проект.",
+        reply_markup=reconnect_keyboard(config.web_app_url),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "menu_status")
+async def cb_menu_status(callback: CallbackQuery) -> None:
+    settings = await get_chat_settings(callback.message.chat.id)
+    await callback.message.edit_text(
+        await render_status(callback.message.chat.id),
+        parse_mode="HTML",
+        reply_markup=main_menu_keyboard(is_chat_connected(settings)),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "menu_send_tasks")
+async def cb_send_tasks(callback: CallbackQuery) -> None:
+    if not await is_callback_admin(callback):
+        await callback.answer("Только администратор может запускать рассылку.", show_alert=True)
+        return
+    fake_message = callback.message
+    await send_digest_and_report(fake_message)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "menu_process_now")
+async def cb_process_now(callback: CallbackQuery) -> None:
+    if not await is_callback_admin(callback):
+        await callback.answer("Только администратор может запускать обработку очереди.", show_alert=True)
+        return
+    await callback.message.answer("🧹 Обрабатываю текущую очередь сообщений...")
+    await process_chat_queue(callback.message.chat.id)
+    await callback.answer()
+
+
+@dp.message(F.web_app_data)
+async def process_web_app_data(message: Message, state: FSMContext) -> None:
+    try:
+        payload = json.loads(message.web_app_data.data)
+    except (json.JSONDecodeError, AttributeError) as exc:
+        await message.answer(f"🔴 Ошибка разбора Web App данных: {exc}", reply_markup=ReplyKeyboardRemove())
+        return
+
+    login = (payload.get("login") or "").strip()
+    password = (payload.get("password") or "").strip()
+    if not login or not password:
+        await message.answer("🔴 Логин или пароль не переданы.", reply_markup=ReplyKeyboardRemove())
+        return
+
+    status = await message.answer("⏳ Подключаюсь к YouGile...", reply_markup=ReplyKeyboardRemove())
+    companies, status_code = await get_companies(login, password)
+    if not companies:
+        text = "🔴 Нет доступных компаний." if status_code in (200, 201) else "🔴 Неверный логин или пароль."
+        await status.edit_text(text)
+        return
+
+    await state.set_state(AuthStates.waiting_for_company)
+    await state.update_data(login=login, password=password)
+    await status.delete()
+    await message.answer(
+        f"🍏 <b>Успешный вход!</b>\nАккаунт: <code>{login}</code>\n\nВыберите компанию:",
+        parse_mode="HTML",
+        reply_markup=companies_keyboard(companies),
+    )
+
+
+@dp.callback_query(AuthStates.waiting_for_company, F.data.startswith("company_"))
+async def process_company_choice(callback: CallbackQuery, state: FSMContext) -> None:
+    company_id = callback.data.removeprefix("company_")
+    auth_data = await state.get_data()
+
+    await callback.message.edit_text("⏳ Получаю или создаю API-ключ YouGile...")
+    api_key, status_code = await get_or_create_api_key(
+        auth_data["login"],
+        auth_data["password"],
+        company_id,
+    )
+    if not api_key:
+        await callback.message.edit_text(
+            "🔴 Сервер не вернул API-ключ.\n\n"
+            f"HTTP статус последней попытки: {status_code}.\n"
+            "Я попробовал получить существующий ключ и создать новый автоматически. "
+            "Проверьте права администратора/организатора в выбранной компании."
+        )
+        await state.clear()
+        await callback.answer()
+        return
+
+    await callback.message.edit_text("⏳ API-ключ получен. Загружаю список проектов...")
+    projects, status_code = await get_projects(api_key)
+    if not projects:
+        await callback.message.edit_text(f"🔴 Не удалось получить проекты (HTTP {status_code}).")
+        await state.clear()
+        await callback.answer()
+        return
+
+    await state.set_state(AuthStates.waiting_for_project)
+    await state.update_data(api_key=api_key, company_id=company_id)
+    await callback.message.edit_text(
+        "📁 Выберите проект для создания задач:",
+        reply_markup=projects_keyboard(projects),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(AuthStates.waiting_for_project, F.data.startswith("project_"))
+async def process_project_choice(callback: CallbackQuery, state: FSMContext) -> None:
+    project_id = callback.data.removeprefix("project_")
+    auth_data = await state.get_data()
+    api_key = auth_data["api_key"]
+
+    await callback.message.edit_text("⏳ Разворачиваю доску «Канбан AI PM» и 5 колонок...")
+    board_result = await asyncio.to_thread(create_ai_pm_board, api_key, project_id)
+    if not board_result["success"]:
+        await callback.message.edit_text("🔴 Не удалось создать структуру колонок. Проверьте права токена.")
+        await state.clear()
+        await callback.answer()
+        return
+
+    await save_board_settings(callback.message.chat.id, api_key, project_id, board_result)
+    await asyncio.to_thread(update_env_file, "YOUGILE_API_KEY", api_key)
+    await asyncio.to_thread(update_env_file, "YOUGILE_COMPANY_ID", auth_data["company_id"])
+
+    await callback.message.edit_text(
+        "🚀 <b>Структура AI-доски успешно развёрнута!</b>\n\n"
+        "Создана доска <b>«Канбан AI PM»</b> с 5 колонками:\n"
+        "👥 Участники → 📥 Без дедлайна → 📅 Дедлайн есть → 🔥 Горит → ✅ Выполнено\n\n"
+        "<b>Что дальше:</b> просто общайтесь в группе — бот сам создаст задачи "
+        "и карточки участников.",
+        parse_mode="HTML",
+    )
+    await state.clear()
+    await callback.answer()
+
 
 @dp.message(F.text)
 async def handle_all_messages(message: Message) -> None:
     if not message.text or message.text.startswith("/"):
         return
 
-    username = (
-        f"@{message.from_user.username}"
-        if message.from_user.username
-        else message.from_user.first_name
-    )
     chat_id = message.chat.id
-    now     = time.monotonic()
+    username = username_from_message_user(message.from_user)
+    await upsert_chat_member(chat_id, message.from_user.id, username)
+    await save_pending_message(chat_id, username, message.text)
+    chat_start_times.setdefault(chat_id, time.monotonic())
+    await schedule_chat_processing(chat_id)
 
-    chat_buffers.setdefault(chat_id, []).append(
-        {"username": username, "text": message.text}
-    )
-    chat_start_times.setdefault(chat_id, now)
 
-    elapsed = now - chat_start_times[chat_id]
-
-    if elapsed >= MAX_CONVERSATION_TIME:
-        await _cancel_timer(chat_id)
-        asyncio.create_task(process_live_conversation(chat_id))
-    else:
-        await _cancel_timer(chat_id)
-        chat_timers[chat_id] = asyncio.create_task(_debounce_timer(chat_id))
-
-# ---------------------------------------------------------------------------
-# Точка входа
-# ---------------------------------------------------------------------------
-
-async def main() -> None:
+async def set_bot_commands() -> None:
     await bot.set_my_commands([
+        BotCommand(command="menu", description="🧭 Открыть панель управления"),
         BotCommand(command="get_key", description="🔑 Авторизоваться / Выбрать проект YouGile"),
-        BotCommand(command="stats",   description="📋 Статистика очереди чата"),
-        BotCommand(command="start",   description="🤖 Информация о боте"),
+        BotCommand(command="status", description="📊 Проверить подключение и очередь"),
+        BotCommand(command="send_tasks", description="📨 Разослать задачи ответственным"),
+        BotCommand(command="stats", description="📋 Статистика очереди чата"),
+        BotCommand(command="start", description="🤖 Информация о боте"),
     ])
 
-    # Запускаем фоновый воркер миграции задач
-    asyncio.create_task(background_migrator())
 
-    print("[SERVER] AI PM запущен. In-Memory режим. Миграция задач активна.")
+async def main() -> None:
+    await init_db()
+    await set_bot_commands()
+    asyncio.create_task(monitor_deadlines(bot, config.migration_interval))
+
+    print("[SERVER] AI PM запущен. Обвязка разнесена по сервисам.")
     await dp.start_polling(bot)
 
 

@@ -2,6 +2,7 @@ aiofiles==25.1.0
 aiogram==3.28.2
 aiohappyeyeballs==2.6.2
 aiohttp==3.13.5
+aiosqlite==0.22.0
 aiosignal==1.4.0
 alembic==1.18.4
 annotated-doc==0.0.4
